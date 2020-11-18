@@ -1,29 +1,15 @@
 import copy
+import time
 
 import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from fvt.layers import GraphConvolution, GraphAttentionLayer
-from scipy.sparse import csr_matrix
-import scipy.sparse as sp
+from fvt.layers import GraphConvolution
+from pytorch_pretrained_bert import BertModel
 
-from pytorch_pretrained_bert import BertModel, BertTokenizer
-from numpy import linalg
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
-
-
-class joint_embedding(nn.Module):
-    def __init__(self, ori_fea_dim, joint_embedding_dim):
-        super(joint_embedding, self).__init__()
-        self.img_feature = nn.Linear(ori_fea_dim, joint_embedding_dim)
-        self.tanh = nn.Tanh()
-
-    def forward(self, img):
-        img_feature = self.img_feature(img)
-        img_feature = self.tanh(img_feature)  # [batch_size,joint_embedding_dim]
-        return img_feature
 
 
 class Gated_Embedding_Unit(nn.Module):
@@ -73,15 +59,10 @@ class Sentence_Maxpool(nn.Module):
 class GCN(nn.Module):
     def __init__(self, args):
         super(GCN, self).__init__()
-        self.init_scale = args.init_scale
 
-        # regularization strength
-        self.alpha = args.alpha
         self.gcn_input_dim = args.in_features
         self.gcn_output_dim = args.out_features
-        self.gcn_join_dim = args.gcn_join_dim
         self.dropout = args.dropout
-
         self.GCN = GraphConvolution(self.gcn_input_dim, self.gcn_output_dim, args.n_gcn)
 
     def forward(self, node_features, adj):
@@ -90,44 +71,37 @@ class GCN(nn.Module):
         return Z
 
 
-class Net(nn.Module):
+class FCA(nn.Module):
     def __init__(self, args):
-        super(Net, self).__init__()
-        self.init_scale = args.init_scale
+        super(FCA, self).__init__()
 
-        # regularization strength
-        self.alpha = args.alpha
         self.batch_size = args.batch_size
-        self.kee_prob = args.keep_prob
         self.video_fea_dim = args.video_fea_dim
         self.joint_embedding_dim = args.joint_embedding_dim
-        self.text_embedding_size = args.text_embedding_size
-        self.hidden_size = args.hidden_size
-        self.graph_nodes = args.graph_nodes
-        self.gcn_input_dim = args.in_features
-        self.gcn_output_dim = args.out_features
+        self.text_fea_dim = args.text_fea_dim
         self.gcn_join_dim = args.gcn_join_dim
         self.dropout = args.dropout
-
 
         # BERT
         self.bert = BertModel.from_pretrained('/data/project/GGBT/data/torch-bert-weights/bert-base-uncased/bert-base-uncased')
 
+        # GCN
         self.GCN = GCN(args)
 
         self.gcn_aten_pool = nn.Sequential(
-            nn.Linear(768, 768 // 2),
+            nn.Linear(self.joint_embedding_dim, self.joint_embedding_dim // 2),
             nn.Tanh(),
-            nn.Linear(768 // 2, 1),
+            nn.Linear(self.joint_embedding_dim // 2, 1),
             nn.Softmax(dim=0)
         )
 
-        self.text_pooling = Sentence_Maxpool(self.text_embedding_size, 768)
-        #self.Gu_graph = Gated_Embedding_Unit(self.graph_pooling.out_dim, self.hidden_size, gating=True)
+        self.text_pooling = Sentence_Maxpool(self.text_fea_dim, self.joint_embedding_dim)
 
-        self.GU_text = Gated_Embedding_Unit(self.text_pooling.out_dim, 768, gating=True)
-        self.video_bags_feature = joint_embedding(1024, 768)
-        self.video_bags_feature_all = Gated_Embedding_Unit(1536, 768)
+        self.GU_text = Gated_Embedding_Unit(self.text_pooling.out_dim, self.joint_embedding_dim, gating=True)
+
+        self.video_unit_features = Gated_Embedding_Unit(self.video_fea_dim, self.joint_embedding_dim)
+
+        self.video_unit_features_all = Gated_Embedding_Unit(self.gcn_join_dim, self.joint_embedding_dim)
 
         self._initialize_weights()
 
@@ -148,96 +122,108 @@ class Net(nn.Module):
     def forward(self, inputs):
 
         outs_dic = inputs
-        batch_size = outs_dic['video_bags'].shape[0]
+        batch_size = outs_dic['video_units'].shape[0]
 
-        batch_video_feature = []
-        batch_sentence_feature = []
+        batch_video_features = []
+        batch_sentence_features = []
         batch_adj = []
         batch_adj_new = []
-        # 对每个batch中的视频特征个数 和文本个数做处理
+
+        # process the video and text in each batch
         for i in range(batch_size):
-            # get 真实视频特征的个数
-            video_bags_real = outs_dic['video_bags'][i][outs_dic['video_mask'][i]]
-            video_bags_num = video_bags_real.shape[0]
-            # get 真实文本特征的个数
-            sentence_bags_real = outs_dic['sentence_bags'][i][outs_dic['sentence_mask'][i]]
-            sentence_bags_num = sentence_bags_real.shape[0]
-            video_bags_real = self.video_bags_feature(video_bags_real.cuda()) # (x, 1024)-> (x, 768) x: 视频特征个数
-            sentence_bags_features = self.bert(sentence_bags_real.cuda(), output_all_encoded_layers=False)[0] #(y, 15, 768)
-            sentence_bags_features = self.GU_text(self.text_pooling(sentence_bags_features)) # 获取最终文本特征 (y, 768) y: 文本特征个数
-            node_features = torch.cat([video_bags_real, sentence_bags_features], 0) # (x+y, 768)
 
+            # get raw visual semantic units
+            video_unit_features = outs_dic['video_units'][i][outs_dic['video_mask'][i]]
+            video_units_num = video_unit_features.shape[0]
 
-            # 建立邻接矩阵
-            length = video_bags_num + sentence_bags_num
-            A = np.zeros((length, length), dtype=np.float32)
-            for i in range(length):
-                for j in range(i+1, length):
-                    if (i <= video_bags_num-1 and j > video_bags_num-1):
+            # get raw phrases
+            phrases = outs_dic['phrases'][i][outs_dic['phrase_mask'][i]]
+            phrases_num = phrases.shape[0]
 
-                        if torch.cosine_similarity(node_features[i], node_features[j], dim=0) > 0.01:
-                            A[i][j] = 1
-                            A[j][i] = 1
-            # 传入GCN前,对邻接矩阵做正则化.
+            video_unit_features = self.video_unit_features(video_unit_features.cuda())
+            phrase_features = self.bert(phrases.cuda(), output_all_encoded_layers=False)[0]
+            phrase_features = self.GU_text(self.text_pooling(phrase_features))
+            node_features = torch.cat([video_unit_features, phrase_features], 0)
+
+            # initialize adjacency matrix A
+            A = torch.mm(node_features, torch.t(node_features))
+            A = torch.sigmoid(A)
+            A = A.detach().cpu().numpy()
+
+            # process into bipartite
+            for i in range(A.shape[0]):
+                for j in range(i+1, A.shape[0]):
+
+                    A[i][i] = 0
+                    A[j][j] = 0
+
+                    if (i <= video_units_num-1 and j > video_units_num-1):
+
+                        A[i][j] = A[i][j]
+                        A[j][i] = A[j][i]
+
+                    else:
+                        A[i][j] = 0
+                        A[j][i] = 0
+
             I = np.eye(A.shape[0])
             A_hat = A + I
-
             D_hat = np.array(np.sum(A_hat, axis=0))
             D_inv = np.power(D_hat, -0.5)
             D_mat = np.matrix(np.diag(D_inv))
             norm_adj = np.asmatrix(D_mat) @ np.asmatrix(A_hat)
             norm_adj = norm_adj @ np.asmatrix(D_mat)
             norm_adj = torch.from_numpy(norm_adj).float().cuda()
-            # get 所有节点特征
             Z = self.GCN(node_features, norm_adj)
-            Z = self.video_bags_feature_all(Z)
-
+            Z = self.video_unit_features_all(Z)
             Z = F.dropout(Z, self.dropout, training=self.training)
 
-            # reconstruct A
-            A_new = torch.mm(Z, torch.t(Z))
-            A_new = torch.sigmoid(A_new)
+            # reconstruct adjacency matrix A
+            A_new_re = torch.mm(Z, torch.t(Z))
+            A_new_re = torch.sigmoid(A_new_re)
+            A_new = A_new_re.detach().cpu().numpy()
 
-            # select A
-            #A_new = A_new > 0.6
-            #A_new = A_new.float()
-            # 利用A_new 再次get 所有节点特征 Z_new
-            A_new_hat = A_new.detach().cpu().numpy() + I
+            # process into bipartite
+            for i in range(A_new.shape[0]):
+                for j in range(i + 1, A_new.shape[0]):
+
+                    A_new[i][i] = 0
+                    A_new[j][j] = 0
+
+                    if (i <= video_units_num - 1 and j > video_units_num - 1):
+                        A_new[i][j] = A_new[i][j]
+                        A_new[j][i] = A_new[j][i]
+                    else:
+                        A_new[i][j] = 0
+                        A_new[j][i] = 0
+
+            A_new_hat = A_new + I
             D_new_hat = np.array(np.sum(A_new_hat, axis=0))
             D_new_inv = np.power(D_new_hat, -0.5)
             D_new_mat = np.matrix(np.diag(D_new_inv))
             norm_adj_new = np.asmatrix(D_new_mat) @ np.asmatrix(A_new_hat)
             norm_adj_new = norm_adj_new @ np.asmatrix(D_new_mat)
             norm_adj_new = torch.from_numpy(norm_adj_new).float().cuda()
-
             Z_new = self.GCN(node_features, norm_adj_new)
-            Z_new = self.video_bags_feature_all(Z_new)
-            # get 优化后的视频特征和文本特征
-            video_feature, sentence_feature = torch.split(Z_new, [video_bags_num, sentence_bags_num]) # (x, 768) # (y, 768)
+            Z_new = self.video_unit_features_all(Z_new)
+            video_feature, sentence_feature = torch.split(Z_new, [video_units_num, phrases_num])
 
-            # mean -> sum
-            #
+            # self attention pooling
             local_att_v = self.gcn_aten_pool(video_feature)
-            video_feature = torch.sum(video_feature * local_att_v, dim=0) #(768)
+            video_feature = torch.sum(video_feature * local_att_v, dim=0)
 
             local_att_s = self.gcn_aten_pool(sentence_feature)
-            sentence_feature = torch.sum(sentence_feature * local_att_s, dim=0) #(768)
-
-            #video_feature = torch.mean(video_feature, dim=0, keepdim=False)
-            #sentence_feature = torch.mean(sentence_feature, dim=0, keepdim=False)
-            #重新将数据组成 batch
+            sentence_feature = torch.sum(sentence_feature * local_att_s, dim=0)
 
             batch_adj.append(A)
-            batch_adj_new.append(A_new)
-            batch_video_feature.append(video_feature)
-            batch_sentence_feature.append(sentence_feature)
+            batch_adj_new.append(A_new_re)
+            batch_video_features.append(video_feature)
+            batch_sentence_features.append(sentence_feature)
 
-        video_features = torch.stack(batch_video_feature, dim=0)  # (128, 768)
-        sentence_features = torch.stack(batch_sentence_feature, dim=0)  # (128, 768)
+        video_features = torch.stack(batch_video_features, dim=0)
+        sentence_features = torch.stack(batch_sentence_features, dim=0)
 
         return sentence_features, video_features, batch_adj, batch_adj_new
-
-
 
 
 if __name__ == '__main__':

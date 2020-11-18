@@ -2,33 +2,27 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import unicode_literals
 from __future__ import print_function
+import random
+from pytorch_pretrained_bert import BertTokenizer
 
-import collections
-
-from pytorch_pretrained_bert import BertModel, BertTokenizer
-import torch as th
-import torch.nn.functional as F
 import numpy as np
-import torch
 import torch.utils.data as data
 from sklearn import metrics
 from sklearn.cluster import KMeans
-from torch.nn.utils.rnn import pack_sequence, pad_sequence
 
 
-class YouCook2_Dataset_Train(data.Dataset):
+class MSR_Dataset_Train(data.Dataset):
 
     def __init__(self):
-        super(YouCook2_Dataset_Train, self).__init__()
+        super(MSR_Dataset_Train, self).__init__()
 
         self.tokenizer = BertTokenizer.from_pretrained('/data/project/BAG/data/torch-bert-weights/bert-base-uncased-vocab.txt')
-        train_data = np.load('/data/project/BAG/data/youcook2_data_train.npz', allow_pickle=True)
+        self.video_features = np.load('/media/hing/TXX/bake_bag/data/msr_train7010.npy', allow_pickle=True)
 
-        self.video_features = train_data["video_features"]
-        self.sentences = np.load('/data/project/video/process_sentence/train_sentences.npy', allow_pickle=True)
+        self.sentences = np.load('/data/project/video/msr_sentence/msr_sentence_train_7010.npy', allow_pickle=True)
 
         self.len = self.sentences.shape[0]
-        print(self.len, 31)
+        print(self.len)
 
     def __len__(self):
 
@@ -64,19 +58,20 @@ class YouCook2_Dataset_Train(data.Dataset):
 
             kmeans_labels[kmean.labels_ == label] = time_idx
 
-        video_units = []
+        video_feature_bags = []
         for label in np.unique(kmeans_labels):
             cluster_mask = kmeans_labels == label
+
             video_feature_fragment = video_feature[total_mask][cluster_mask]
-            video_units.append(np.mean(video_feature_fragment, axis=0))
+            video_feature_bags.append(np.mean(video_feature_fragment, axis=0))
 
-        return video_units
+        return video_feature_bags
 
-    def sentence_parsing_pro(self, sentence_list):
+    def sentence_phrases_pro(self, sentence_phrases):
 
         phrases = []
-        for i, v in enumerate(sentence_list):
-            phrases.append(self.get_sentence_ids(sentence_list[i]))
+        for i, v in enumerate(sentence_phrases):
+            phrases.append(self.get_sentence_ids(sentence_phrases[i]))
 
         return phrases
 
@@ -88,13 +83,18 @@ class YouCook2_Dataset_Train(data.Dataset):
         else:
             for num in range(15 - len(sentence_ids)):
                 sentence_ids.append(0)
+
         return sentence_ids
 
     def __getitem__(self, index):
         out = {}
-        sentence = self.sentences[index]
-        phrases = np.array(self.sentence_parsing(sentence))
-        video_feature = self.video_features[index]
+
+        sentences = self.sentences[index]
+        rind = random.randint(0, len(sentences) - 1)
+        sentence_phrases = sentences[rind]
+        phrases = np.array(self.sentence_phrases_pro(sentence_phrases))
+
+        video_feature = self.video_features[index][0]
         video_units = np.array(self.video_clustering(video_feature))
         out['video_units'] = video_units
         out['phrases'] = phrases
@@ -102,17 +102,15 @@ class YouCook2_Dataset_Train(data.Dataset):
         return out
 
 
-class YouCook2_Dataset_Eval(data.Dataset):
+class MSR_Dataset_Eval(data.Dataset):
 
     def __init__(self):
-        super(YouCook2_Dataset_Eval, self).__init__()
+        super(MSR_Dataset_Eval, self).__init__()
 
         self.tokenizer = BertTokenizer.from_pretrained(
             '/data/project/BAG/data/torch-bert-weights/bert-base-uncased-vocab.txt')
-        train_data = np.load('/data/project/BAG/data/youcook2_data_test.npz', allow_pickle=True)
-
-        self.video_features = train_data["video_features"]
-        self.sentences = np.load('/data/project/video/process_sentence/test_sentences.npy', allow_pickle=True)
+        self.video_features = np.load('/media/hing/TXX/bake_bag/data/msr_jsfusion_test1000.npy', allow_pickle=True)
+        self.sentences = np.load('/data/project/video/msr_sentence/msr_sentence_test1000.npy', allow_pickle=True)
 
         self.len = self.sentences.shape[0]
         print(self.len)
@@ -154,16 +152,17 @@ class YouCook2_Dataset_Eval(data.Dataset):
         video_units = []
         for label in np.unique(kmeans_labels):
             cluster_mask = kmeans_labels == label
+
             video_feature_fragment = video_feature[total_mask][cluster_mask]
             video_units.append(np.mean(video_feature_fragment, axis=0))
 
         return video_units
 
-    def sentence_parsing_pro(self, sentence_list):
+    def sentence_phrases_pro(self, sentence_phrases):
 
         phrases = []
-        for i, v in enumerate(sentence_list):
-            phrases.append(self.get_sentence_ids(sentence_list[i]))
+        for i, v in enumerate(sentence_phrases):
+            phrases.append(self.get_sentence_ids(sentence_phrases[i]))
 
         return phrases
 
@@ -179,18 +178,15 @@ class YouCook2_Dataset_Eval(data.Dataset):
 
     def __getitem__(self, index):
         out = {}
-        sentence = self.sentences[index]
-        phrases = np.array(self.sentence_parsing_pro(sentence))
-        video_feature = self.video_features[index]
+        sentences = self.sentences[index]
+        sentence_phrases = sentences
+        phrases = np.array(self.sentence_phrases_pro(sentence_phrases))
+        video_feature = self.video_features[index][0]
         video_units = np.array(self.video_clustering(video_feature))
         out['video_units'] = video_units
         out['phrases'] = phrases
 
         return out
-
-
-
-
 
 
 

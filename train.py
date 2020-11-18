@@ -1,24 +1,24 @@
 import os
 import time
 import argparse
-import torch.nn.functional as F
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data as data
 import copy
-from data.youcook2_dataloader import YouCook2_Dataset_Train
-from data.youcook2_dataloader import YouCook2_Dataset_Eval
-from fvt.model import Net
-from fvt.utils import compute_metrics, print_computed_metrics, record_info, record_best
+from fca_net.msr_dataloader import MSR_Dataset_Train
+from fca_net.msr_dataloader import MSR_Dataset_Eval
+from fca_net.model import FCA
+from fvt.utils import record_info
+
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else "cpu")
 
 
-class myloss(nn.Module):
+class ranking_loss(nn.Module):
 
     def __init__(self, delta):
-        super(myloss, self).__init__()
+        super(ranking_loss, self).__init__()
         self.delta = delta
 
     def forward(self, x, y):
@@ -27,10 +27,12 @@ class myloss(nn.Module):
         x = x / torch.sqrt(torch.sum(torch.mul(x, x), dim=1, keepdim=True))
         y = y / torch.sqrt(torch.sum(torch.mul(y, y), dim=1, keepdim=True))
 
-        similarity_m = torch.mm(x, y.t())  # similarity matrix
+        # similarity matrix
+        similarity_m = torch.mm(x, y.t())
 
+        # correct similarity
         cor_similarity = torch.mul(torch.ones(x.size(0), x.size(
-            0)).cuda(), torch.diag(similarity_m)).t()  # correct similarity
+            0)).cuda(), torch.diag(similarity_m)).t()
         zero_m = torch.zeros(x.size(0), x.size(0)).cuda()
         loss = torch.max(zero_m, similarity_m - cor_similarity + self.delta) + \
                torch.max(zero_m, similarity_m.t() - cor_similarity + self.delta)
@@ -44,12 +46,15 @@ class myloss(nn.Module):
             recall = []
             score = similarity_m - cor_similarity
             _, pred = score.topk(10, 1, True, True)
+
             pred = pred.t()  # shape:(10,N)
 
             target = torch.from_numpy(
                 np.arange(0, x.size(0))).long().cuda().expand_as(pred)
+
             correct = pred.eq(target)
             for k in [1, 5, 10]:
+
                 recall.append(torch.sum(correct[:k]))
 
         return loss, recall
@@ -57,15 +62,13 @@ class myloss(nn.Module):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--alpha', type=float, default=0.000004,
-                        help='regularization strength')
     parser.add_argument('--delta', type=float, default=0.2,
                         help='margin for loss')
     parser.add_argument('--in_features', type=int, default=768,
                         help='gcn input features')
     parser.add_argument('--out_features', type=int, default=768,
                         help='gcn output features')
-    parser.add_argument('--gcn_join_dim', type=int, default=1024,
+    parser.add_argument('--gcn_join_dim', type=int, default=1536,
                         help='dimension of joint embedding')
     parser.add_argument('--dropout', type=float, default=0.5,
                         help='Dropout rate(1- keep probability)')
@@ -73,54 +76,42 @@ def main():
                         help='Alpha for the leaky_relu')
     parser.add_argument('--n_gcn', type=int, default=2,
                         help='number of gcn layers')
-    parser.add_argument('--graph_nodes', type=int, default=640,
-                        help='number of graph nodes')
-    parser.add_argument('--init_scale', type=float, default=0.001,
-                        help='scale for random uniform initializer')
-    parser.add_argument('--batch_size', type=int, default=3350,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='size for a minibatch')
-    parser.add_argument('--keep_prob', type=float, default=0.5,
-                        help='dropout keep probability')
-    parser.add_argument('--video_fea_dim', type=int, default=4096,
+    parser.add_argument('--video_fea_dim', type=int, default=1024,
                         help='the dimension of video feature')
-    parser.add_argument('--num_epochs', type=str, default=20,
+    parser.add_argument('--text_fea_dim', type=int, default=768,
+                        help='embedding size for word to vec')
+    parser.add_argument('--joint_embedding_dim', type=int, default=768,
+                        help='dimension of joint embedding space')
+    parser.add_argument('--num_epochs', type=str, default=1,
                         help='number of ephochs')
-    parser.add_argument('--learning_rate', type=float, default=0.00001,
+    parser.add_argument('--learning_rate', type=float, default=0.0001,
                         help='learning rate')
-    parser.add_argument('--decay_rate', type=float, default=0.5,
-                        help='decay rate')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum for learning')
-    parser.add_argument('--joint_embedding_dim', type=int, default=1024,
-                        help='dimension of joint embedding space')
-    parser.add_argument('--text_embedding_size', type=int, default=768,
-                        help='embedding size for word to vec')
-    parser.add_argument('--hidden_size', type=int, default=1024,
-                        help='dimension of hidden vector')
     parser.add_argument('--max_sentence_length', type=int, default=20,
                         help='maximun length of sentence')
-    parser.add_argument('--max_sentence_num', type=int, default=20,
-                        help='maximun number of sentence')
     parser.add_argument('--grad_clip', type=int, default=5,
                         help='grad clip to prevent gradient explode')
     parser.add_argument('--evaluate_every', type=int, default=1000,
                         help='evaluation frequency')
-    parser.add_argument('--youcook2', type=int, default=1,
-                        help='on YouCook2 data')
-    parser.add_argument('--msrvtt', type=int, default=0,
+    parser.add_argument('--msrvtt', type=int, default=1,
                         help='on MSRVTT data')
-    parser.add_argument('--save_dir', type=str, default='/data/project/BAG/model/model_test6.pth',
+    parser.add_argument('--youcook2', type=int, default=0,
+                        help='on YouCook2 data')
+    parser.add_argument('--vatex', type=int, default=0,
+                        help='on VATEX data')
+    parser.add_argument('--save_dir', type=str, default='./model/model_msr.pth',
                         help='directory to store checkpointed models')
-    parser.add_argument('--save_every', type=int, default=6000,
-                        help='save_frequency')
-    parser.add_argument('--resume', type=str, default='/data/project/BAG/model/model_test6.pth',
+    parser.add_argument('--resume', type=str, default='',
                         help='directory to load checkpointed models')
-    parser.add_argument('--evaluate', default=True, action='store_true')
+    parser.add_argument('--evaluate', default=False, action='store_true')
     args = parser.parse_args()
     if os.path.exists('record') is False:
         os.mkdir('record')
 
-    net = Net(args).to(device)
+    net = FCA(args).to(device)
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -140,13 +131,13 @@ def main():
             num *= shape[i]
         param_num += num
     print('total prarameters:', param_num)
-    # 加载数据
-    if args.youcook2:
 
-        train_dataset = YouCook2_Dataset_Train()
-        test_dataset = YouCook2_Dataset_Eval()
+    if args.msrvtt:
 
-        # 数据长度补齐
+        train_dataset = MSR_Dataset_Train()
+        test_dataset = MSR_Dataset_Eval()
+
+        # sequences padding
         def pad_sequences(sequences, padding_value=0):
 
             trailing_dims = sequences[0].shape[1]
@@ -155,7 +146,6 @@ def main():
             out_tensor = torch.from_numpy(sequences[0]).data.new(*out_dims).fill_(padding_value)
             for i, tensor in enumerate(sequences):
                 length = tensor.shape[0]
-                # use index notation to prevent duplicate references to the tensor
 
                 out_tensor[i, :length, ...] = torch.from_numpy(tensor)
 
@@ -164,123 +154,49 @@ def main():
         def collate_func(data):
             outs = {}
             batch_len = len(data)
-            max_seq_length = max([dic['video_bags'].shape[0] for dic in data])
-            max_sentence_length = max([dic['sentence_bags'].shape[0] for dic in data])
+            max_seq_length = max([dic['video_units'].shape[0] for dic in data])
+            max_sentence_length = max([dic['phrases'].shape[0] for dic in data])
             sentence_mask_batch = torch.zeros(batch_len, max_sentence_length, dtype=torch.uint8)
 
             video_mask_batch = torch.zeros(batch_len, max_seq_length, dtype=torch.uint8)
 
-            video_bags_batch = []
-            sentence_bags_batch = []
+            video_units_batch = []
+            sentence_units_batch = []
             for i in range(len(data)):
                 dic = data[i]
-                video_bags_batch.append(dic['video_bags'])
-                sentence_bags_batch.append(dic['sentence_bags'])
-                video_mask_batch[i, :dic['video_bags'].shape[0]] = 1
-                sentence_mask_batch[i, :dic['sentence_bags'].shape[0]] = 1
+                video_units_batch.append(dic['video_units'])
+                sentence_units_batch.append(dic['phrases'])
+                video_mask_batch[i, :dic['video_units'].shape[0]] = 1
+                sentence_mask_batch[i, :dic['phrases'].shape[0]] = 1
 
-            outs['video_bags'] = pad_sequences(video_bags_batch)
-            outs['sentence_bags'] = pad_sequences(sentence_bags_batch)
-            outs['video_mask'] = video_mask_batch      #对应真实数据的标签
-            outs['sentence_mask'] = sentence_mask_batch
+            outs['video_units'] = pad_sequences(video_units_batch)
+            outs['phrases'] = pad_sequences(sentence_units_batch)
+            outs['video_mask'] = video_mask_batch
+            outs['phrase_mask'] = sentence_mask_batch
             return outs
 
         dataloaders_dict = {
             'train': data.DataLoader(
-                train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_func, num_workers=0, drop_last=True
+                train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_func, num_workers=4, drop_last=True
             ),
             'val': data.DataLoader(
-                test_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_func, num_workers=0
+                test_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_func, num_workers=4, drop_last=True
             )
 
         }
 
     optimizer = torch.optim.SGD(
        net.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=0.005)
-    #optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
 
-    criterion = myloss(args.delta)
+    criterion = ranking_loss(args.delta)
     criterion.cuda()
-    bce_loss = nn.BCELoss().cuda()  # 交叉熵损失函数
 
-    if args.evaluate:
-        evaluate(net, dataloaders_dict['val'])
-        return
+    bce_loss = nn.BCELoss().cuda()
 
     net, best_recall = train_model(net, dataloaders_dict, criterion, bce_loss, optimizer, args.num_epochs,
         args.learning_rate)
 
     torch.save(net.state_dict(), args.save_dir)
-
-
-# def evaluate(model, criterion, dataloaders):
-#     model.eval()
-#     running_loss = 0.0
-#
-#     img2text_running_recall1 = 0.0
-#     img2text_running_recall5 = 0.0
-#     img2text_running_recall10 = 0.0
-#
-#
-#     text2img_running_recall1 = 0.0
-#     text2img_running_recall5 = 0.0
-#     text2img_running_recall10 = 0.0
-#
-#     with torch.no_grad():
-#         for outs_dic in dataloaders:
-#             inputs = outs_dic
-#             sentence_features, video_features, _, _ = model(inputs)
-#
-#
-#             classifier_loss, recall = criterion(video_features, sentence_features)
-#
-#             img2text_running_recall1 += recall[0].item()
-#             img2text_running_recall5 += recall[1].item()
-#             img2text_running_recall10 += recall[2].item()
-#
-#             classifier_loss, recall = criterion(sentence_features, video_features)
-#             text2img_running_recall1 += recall[0].item()
-#             text2img_running_recall5 += recall[1].item()
-#             text2img_running_recall10 += recall[2].item()
-#
-#             running_loss += classifier_loss.item() * video_features.size(0)
-#         epoch_loss = running_loss / len(dataloaders.dataset)
-#         img2text_epoch_recall1 = 1.0 * img2text_running_recall1 / len(dataloaders.dataset)
-#         img2text_epoch_recall5 = 1.0 * img2text_running_recall5 / len(dataloaders.dataset)
-#         img2text_epoch_recall10 = 1.0 * img2text_running_recall10 / len(dataloaders.dataset)
-#
-#         text2img_epoch_recall1 = 1.0 * text2img_running_recall1 / len(dataloaders.dataset)
-#         text2img_epoch_recall5 = 1.0 * text2img_running_recall5 / len(dataloaders.dataset)
-#         text2img_epoch_recall10 = 1.0 * text2img_running_recall10 / len(dataloaders.dataset)
-#
-#         print('Loss: {:.4f} \n \
-#                               img2text_recall@1:{:.4f},img2text_recall@5:{:.4f},img2text_recall@10: {:.4f}, \n \
-#                               text2img_recall@1:{:.4f},text2img_recall@5:{:.4f},text2img_recall@10: {:.4f},'.format \
-#                   (epoch_loss, \
-#                    img2text_epoch_recall1, img2text_epoch_recall5, img2text_epoch_recall10, \
-#                    text2img_epoch_recall1, text2img_epoch_recall5, text2img_epoch_recall10))
-
-
-def evaluate(model, dataloaders):
-    model.eval()
-
-    with torch.no_grad():
-        for outs_dic in dataloaders:
-            inputs = outs_dic
-            sentence_features, video_features, _, _ = model(inputs)
-
-            feature = torch.matmul(video_features, sentence_features.t())
-            m = feature.cpu().detach().numpy()
-            metrics = compute_metrics(m)
-            print('Video-to-Text:')
-            print_computed_metrics(metrics)
-
-            feature2 = torch.matmul(sentence_features, video_features.t())
-            n = feature2.cpu().detach().numpy()
-            metrics2 = compute_metrics(n)
-            print('Text-to-Video:')
-            print_computed_metrics(metrics2)
-
 
 
 def train_model(model, dataloaders, criterion, bce_loss, optimizer, num_epochs, learning_rate):
@@ -319,10 +235,12 @@ def train_model(model, dataloaders, criterion, bce_loss, optimizer, num_epochs, 
                 inputs = outs_dic
                 optimizer.zero_grad()
                 with torch.set_grad_enabled(phase == 'train'):
-                    sentence_features, video_features,  A, A_new = model(inputs)    # 数据传入模型
+
+                    sentence_features, video_features, A, A_new = model(inputs)
 
                     bce_loss_sum = 0
-                    # 优化 A_new, 单计算loss 算出一个batch的loss 总和
+
+                    # optimize reconstructed adjacency matrix A_new
                     for index in range(len(A)):
                         A_index = A[index]
                         A_index = torch.from_numpy(A_index).cuda()
